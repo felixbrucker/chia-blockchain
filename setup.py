@@ -65,6 +65,7 @@ kwargs = dict(
         "chia.full_node",
         "chia.timelord",
         "chia.farmer",
+        "chia.farmer.pooling",
         "chia.harvester",
         "chia.introducer",
         "chia.plotting",
