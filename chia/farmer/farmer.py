@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import time
+from asyncio import sleep
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import traceback
@@ -12,6 +13,9 @@ from blspy import AugSchemeMPL, G1Element, G2Element, PrivateKey
 import chia.server.ws_connection as ws  # lgtm [py/import-and-import-from]
 from chia.consensus.coinbase import create_puzzlehash_for_pk
 from chia.consensus.constants import ConsensusConstants
+from chia.consensus.pot_iterations import calculate_sp_interval_iters
+from chia.farmer.pooling.constants import constants
+from chia.farmer.pooling.pool_api_client import PoolApiClient
 from chia.pools.pool_config import PoolWalletConfig, load_pool_config
 from chia.protocols import farmer_protocol, harvester_protocol
 from chia.protocols.pool_protocol import (
@@ -30,7 +34,7 @@ from chia.server.outbound_message import NodeType, make_msg
 from chia.server.ws_connection import WSChiaConnection
 from chia.types.blockchain_format.proof_of_space import ProofOfSpace
 from chia.types.blockchain_format.sized_bytes import bytes32
-from chia.util.bech32m import decode_puzzle_hash
+from chia.util.bech32m import decode_puzzle_hash, encode_puzzle_hash
 from chia.util.config import load_config, save_config, config_path_for_filename
 from chia.util.hash import std_hash
 from chia.util.ints import uint8, uint16, uint32, uint64
@@ -134,9 +138,44 @@ class Farmer:
 
         self.harvester_cache: Dict[str, Dict[str, Tuple[Dict, float]]] = {}
 
+        # OG Pooling setup
+        self.pool_url = self.config.get("pool_url")
+        self.pool_payout_address = self.config.get("pool_payout_address")
+        self.pool_sub_slot_iters = constants.get("POOL_SUB_SLOT_ITERS")
+        self.iters_limit = calculate_sp_interval_iters(self.constants, self.pool_sub_slot_iters)
+        self.pool_difficulty = 1
+
+    def is_pooling_enabled(self):
+        return self.pool_url is not None and self.pool_payout_address is not None
+
     async def _start(self):
         self.update_pool_state_task = asyncio.create_task(self._periodically_update_pool_state_task())
         self.cache_clear_task = asyncio.create_task(self._periodically_clear_cache_and_refresh_task())
+        if not self.is_pooling_enabled():
+            return
+        self.pool_api_client = PoolApiClient(self.pool_url)
+        await self.initialize_pooling()
+
+    async def initialize_pooling(self):
+        pool_info: Dict = {}
+        has_pool_info = False
+        while not has_pool_info:
+            try:
+                pool_info = await self.pool_api_client.get_pool_info()
+                has_pool_info = True
+            except Exception as e:
+                self.log.error(f"Error retrieving pool info: {e}")
+                await sleep(5)
+
+        pool_name = pool_info["name"]
+        self.log.info(f"Connected to pool {pool_name}")
+        self.pool_difficulty = pool_info["minimum_difficulty"]
+        pool_target = bytes.fromhex(pool_info["target_puzzle_hash"][2:])
+        assert len(pool_target) == 32
+        address_prefix = self.config["network_overrides"]["config"][self.config["selected_network"]]["address_prefix"]
+        pool_target_encoded = encode_puzzle_hash(pool_target, address_prefix)
+        if self.pool_target is not pool_target or self.pool_target_encoded is not pool_target_encoded:
+            self.set_reward_targets(farmer_target_encoded=None, pool_target_encoded=pool_target_encoded)
 
     def _close(self):
         self._shut_down = True

@@ -3,11 +3,12 @@ import time
 from typing import Callable, Optional, List, Any, Dict
 
 import aiohttp
-from blspy import AugSchemeMPL, G2Element, PrivateKey
+from blspy import AugSchemeMPL, G2Element, G1Element, PrivateKey
 
 import chia.server.ws_connection as ws
 from chia.consensus.pot_iterations import calculate_iterations_quality, calculate_sp_interval_iters
 from chia.farmer.farmer import Farmer
+from chia.farmer.pooling.og_pool_protocol import PartialPayload, SubmitPartial
 from chia.protocols import farmer_protocol, harvester_protocol
 from chia.protocols.harvester_protocol import PoolDifficulty
 from chia.protocols.pool_protocol import (
@@ -20,6 +21,7 @@ from chia.protocols.protocol_message_types import ProtocolMessageTypes
 from chia.server.outbound_message import NodeType, make_msg
 from chia.types.blockchain_format.pool_target import PoolTarget
 from chia.types.blockchain_format.proof_of_space import ProofOfSpace
+from chia.types.blockchain_format.sized_bytes import bytes32
 from chia.util.api_decorators import api_request, peer_required
 from chia.util.ints import uint32, uint64
 
@@ -95,12 +97,13 @@ class FarmerAPI:
 
                 if new_proof_of_space.sp_hash not in self.farmer.proofs_of_space:
                     self.farmer.proofs_of_space[new_proof_of_space.sp_hash] = []
-                self.farmer.proofs_of_space[new_proof_of_space.sp_hash].append(
-                    (
-                        new_proof_of_space.plot_identifier,
-                        new_proof_of_space.proof,
+
+                    self.farmer.proofs_of_space[new_proof_of_space.sp_hash].append(
+                        (
+                            new_proof_of_space.plot_identifier,
+                            new_proof_of_space.proof,
+                        )
                     )
-                )
                 self.farmer.cache_add_time[new_proof_of_space.sp_hash] = uint64(int(time.time()))
                 self.farmer.quality_str_to_identifiers[computed_quality_string] = (
                     new_proof_of_space.plot_identifier,
@@ -247,6 +250,17 @@ class FarmerAPI:
                     return
 
                 return
+
+            pool_public_key = new_proof_of_space.proof.pool_public_key
+            if pool_public_key is not None and self.farmer.is_pooling_enabled():
+                await self.process_new_proof_of_space_for_pool(
+                    new_proof_of_space,
+                    peer,
+                    pool_public_key,
+                    computed_quality_string
+                )
+
+            return
 
     @api_request
     async def respond_signatures(self, response: harvester_protocol.RespondSignatures):
@@ -425,10 +439,16 @@ class FarmerAPI:
                     p2_singleton_puzzle_hash,
                 )
             )
+        difficulty = new_signage_point.difficulty
+        sub_slot_iters = new_signage_point.sub_slot_iters
+        if self.farmer.is_pooling_enabled():
+            difficulty = self.farmer.pool_difficulty
+            sub_slot_iters = self.farmer.pool_sub_slot_iters
+
         message = harvester_protocol.NewSignagePointHarvester(
             new_signage_point.challenge_hash,
-            new_signage_point.difficulty,
-            new_signage_point.sub_slot_iters,
+            difficulty,
+            sub_slot_iters,
             new_signage_point.signage_point_index,
             new_signage_point.challenge_chain_sp,
             pool_difficulties,
@@ -484,3 +504,86 @@ class FarmerAPI:
     @api_request
     async def respond_plots(self, _: harvester_protocol.RespondPlots):
         self.farmer.log.warning("Respond plots came too late")
+
+    async def process_new_proof_of_space_for_pool(
+            self,
+            new_proof_of_space: harvester_protocol.NewProofOfSpace,
+            peer: ws.WSChiaConnection,
+            pool_public_key: G1Element,
+            computed_quality_string: bytes32
+    ):
+        # Otherwise, send the proof of space to the pool
+        # When we win a block, we also send the partial to the pool
+        required_iters = calculate_iterations_quality(
+            self.farmer.constants.DIFFICULTY_CONSTANT_FACTOR,
+            computed_quality_string,
+            new_proof_of_space.proof.size,
+            self.farmer.pool_difficulty,
+            new_proof_of_space.sp_hash,
+        )
+        if required_iters >= self.farmer.iters_limit:
+            self.farmer.log.info(
+                f"Proof of space not good enough for pool difficulty of {self.farmer.pool_difficulty}"
+            )
+            return
+
+        # Submit partial to pool
+        is_eos = new_proof_of_space.signage_point_index == 0
+        payload = PartialPayload(
+            new_proof_of_space.proof,
+            new_proof_of_space.sp_hash,
+            is_eos,
+            self.farmer.pool_payout_address
+        )
+
+        # The plot key is 2/2 so we need the harvester's half of the signature
+        m_to_sign = payload.get_hash()
+        request = harvester_protocol.RequestSignatures(
+            new_proof_of_space.plot_identifier,
+            new_proof_of_space.challenge_hash,
+            new_proof_of_space.sp_hash,
+            [m_to_sign],
+        )
+        response: Any = await peer.request_signatures(request)
+        if not isinstance(response, harvester_protocol.RespondSignatures):
+            self.farmer.log.error(f"Invalid response from harvester: {response}")
+            return
+
+        assert len(response.message_signatures) == 1
+
+        plot_signature: Optional[G2Element] = None
+        for sk in self.farmer.get_private_keys():
+            pk = sk.get_g1()
+            if pk == response.farmer_pk:
+                agg_pk = ProofOfSpace.generate_plot_public_key(response.local_pk, pk)
+                assert agg_pk == new_proof_of_space.proof.plot_public_key
+                sig_farmer = AugSchemeMPL.sign(sk, m_to_sign, agg_pk)
+                plot_signature = AugSchemeMPL.aggregate([sig_farmer, response.message_signatures[0][1]])
+                assert AugSchemeMPL.verify(agg_pk, m_to_sign, plot_signature)
+        pool_sk = self.farmer.pool_sks_map[bytes(pool_public_key)]
+        authentication_signature = AugSchemeMPL.sign(pool_sk, m_to_sign)
+
+        assert plot_signature is not None
+        agg_sig: G2Element = AugSchemeMPL.aggregate([plot_signature, authentication_signature])
+
+        submit_partial = SubmitPartial(payload, agg_sig)
+        self.farmer.log.debug("Submitting partial ..")
+        submit_partial_response: Dict
+        try:
+            submit_partial_response = await self.farmer.pool_api_client.submit_partial(submit_partial)
+        except Exception as e:
+            self.farmer.log.error(f"Error submitting partial to pool: {e}")
+            return
+        self.farmer.log.debug(f"Pool response: {submit_partial_response}")
+        if "error_code" in submit_partial_response:
+            self.farmer.log.error(
+                f"Error in pooling: {submit_partial_response['error_code'], submit_partial_response['error_message']}"
+            )
+            if submit_partial_response["error_code"] == 5:
+                self.farmer.log.error(
+                    "Difficulty too low, adjusting to pool difficulty "
+                    f"({submit_partial_response['current_difficulty']})"
+                )
+                self.farmer.pool_difficulty = submit_partial_response["current_difficulty"]
+        else:
+            self.farmer.pool_difficulty = submit_partial_response["current_difficulty"]
