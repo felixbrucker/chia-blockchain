@@ -568,6 +568,7 @@ class FarmerAPI:
 
         submit_partial = SubmitPartial(payload, agg_sig)
         self.farmer.log.debug("Submitting partial ..")
+        self.farmer.last_pool_partial_submit_timestamp = time.time()
         submit_partial_response: Dict
         try:
             submit_partial_response = await self.farmer.pool_api_client.submit_partial(submit_partial)

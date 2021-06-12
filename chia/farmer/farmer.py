@@ -144,6 +144,10 @@ class Farmer:
         self.pool_sub_slot_iters = constants.get("POOL_SUB_SLOT_ITERS")
         self.iters_limit = calculate_sp_interval_iters(self.constants, self.pool_sub_slot_iters)
         self.pool_difficulty = 1
+        self.pool_minimum_difficulty = 1
+        self.pool_var_diff_target_in_seconds = 5 * 60
+        self.last_pool_partial_submit_timestamp: float = time.time()
+        self.adjust_pool_difficulty_task: Optional[asyncio.Task] = None
 
     def is_pooling_enabled(self):
         return self.pool_url is not None and self.pool_payout_address is not None
@@ -152,9 +156,11 @@ class Farmer:
         self.update_pool_state_task = asyncio.create_task(self._periodically_update_pool_state_task())
         self.cache_clear_task = asyncio.create_task(self._periodically_clear_cache_and_refresh_task())
         if not self.is_pooling_enabled():
+            self.log.info(f"Not pooling as 'pool_payout_address' and/or 'pool_url' are missing in your config")
             return
         self.pool_api_client = PoolApiClient(self.pool_url)
         await self.initialize_pooling()
+        self.adjust_pool_difficulty_task = asyncio.create_task(self._periodically_adjust_pool_difficulty_task())
 
     async def initialize_pooling(self):
         pool_info: Dict = {}
@@ -170,6 +176,8 @@ class Farmer:
         pool_name = pool_info["name"]
         self.log.info(f"Connected to pool {pool_name}")
         self.pool_difficulty = pool_info["minimum_difficulty"]
+        self.pool_minimum_difficulty = self.pool_difficulty
+        self.pool_var_diff_target_in_seconds = pool_info["var_diff_target_in_seconds"]
         pool_target = bytes.fromhex(pool_info["target_puzzle_hash"][2:])
         assert len(pool_target) == 32
         address_prefix = self.config["network_overrides"]["config"][self.config["selected_network"]]["address_prefix"]
@@ -183,6 +191,8 @@ class Farmer:
     async def _await_closed(self):
         await self.cache_clear_task
         await self.update_pool_state_task
+        if self.adjust_pool_difficulty_task is not None:
+            await self.adjust_pool_difficulty_task
 
     def _set_state_changed_callback(self, callback: Callable):
         self.state_changed_callback = callback
@@ -688,3 +698,29 @@ class Farmer:
                 log.error(f"_periodically_clear_cache_and_refresh_task failed: {traceback.print_exc()}")
 
             await asyncio.sleep(1)
+
+    async def _periodically_adjust_pool_difficulty_task(self):
+        time_slept = 0
+        while not self._shut_down:
+            # Sleep in 1 sec intervals to quickly exit outer loop, but effectively sleep 60 sec between actual code runs
+            await sleep(1)
+            time_slept += 1
+            if time_slept < 60:
+                continue
+            time_slept = 0
+            if (time.time() - self.last_pool_partial_submit_timestamp) < self.pool_var_diff_target_in_seconds:
+                continue
+            diff_since_last_partial_submit_in_seconds = time.time() - self.last_pool_partial_submit_timestamp
+            missing_partial_submits = diff_since_last_partial_submit_in_seconds // self.pool_var_diff_target_in_seconds
+            new_difficulty = int(max(
+                (self.pool_difficulty - (missing_partial_submits * 2)),
+                self.pool_minimum_difficulty
+            ))
+            if new_difficulty == self.pool_difficulty:
+                continue
+            old_difficulty = self.pool_difficulty
+            self.pool_difficulty = new_difficulty
+            log.info(
+                f"Lowered the pool difficulty from {old_difficulty} to {new_difficulty} due to no partial submits "
+                f"within the last {int(round(diff_since_last_partial_submit_in_seconds))} seconds"
+            )
