@@ -531,7 +531,6 @@ class FarmerAPI:
         is_eos = new_proof_of_space.signage_point_index == 0
         payload = PartialPayload(
             new_proof_of_space.proof,
-            self.farmer.pool_difficulty,
             new_proof_of_space.sp_hash,
             is_eos,
             self.farmer.pool_payout_address
@@ -567,7 +566,7 @@ class FarmerAPI:
         assert plot_signature is not None
         agg_sig: G2Element = AugSchemeMPL.aggregate([plot_signature, authentication_signature])
 
-        submit_partial = SubmitPartial(payload, agg_sig)
+        submit_partial = SubmitPartial(payload, agg_sig, self.farmer.pool_difficulty)
         self.farmer.log.debug("Submitting partial ..")
         self.farmer.last_pool_partial_submit_timestamp = time.time()
         submit_partial_response: Dict
