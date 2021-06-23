@@ -531,6 +531,7 @@ class FarmerAPI:
         is_eos = new_proof_of_space.signage_point_index == 0
         payload = PartialPayload(
             new_proof_of_space.proof,
+            self.farmer.pool_difficulty,
             new_proof_of_space.sp_hash,
             is_eos,
             self.farmer.pool_payout_address
