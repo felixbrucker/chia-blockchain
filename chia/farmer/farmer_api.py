@@ -578,14 +578,15 @@ class FarmerAPI:
             return
         self.farmer.log.debug(f"Pool response: {submit_partial_response}")
         if "error_code" in submit_partial_response:
-            self.farmer.log.error(
-                f"Error in pooling: {submit_partial_response['error_code'], submit_partial_response['error_message']}"
-            )
             if submit_partial_response["error_code"] == 5:
-                self.farmer.log.error(
+                self.farmer.log.info(
                     "Difficulty too low, adjusting to pool difficulty "
                     f"({submit_partial_response['current_difficulty']})"
                 )
                 self.farmer.pool_difficulty = submit_partial_response["current_difficulty"]
+            else:
+                self.farmer.log.error(
+                    f"Error in pooling: {submit_partial_response['error_code'], submit_partial_response['error_message']}"
+                )
         else:
             self.farmer.pool_difficulty = submit_partial_response["current_difficulty"]
