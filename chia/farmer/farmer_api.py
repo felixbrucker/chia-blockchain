@@ -441,8 +441,13 @@ class FarmerAPI:
         difficulty = new_signage_point.difficulty
         sub_slot_iters = new_signage_point.sub_slot_iters
         if self.farmer.is_pooling_enabled():
-            difficulty = self.farmer.pool_difficulty
-            sub_slot_iters = self.farmer.pool_sub_slot_iters
+            lowest_difficulty: Optional[uint64] = None
+            for _, og_pool_state in self.farmer.og_pool_state.items():
+                if lowest_difficulty is None or lowest_difficulty > og_pool_state.difficulty:
+                    lowest_difficulty = og_pool_state.difficulty
+            if lowest_difficulty is not None:
+                difficulty = lowest_difficulty
+                sub_slot_iters = self.farmer.constants.POOL_SUB_SLOT_ITERS
 
         message = harvester_protocol.NewSignagePointHarvester(
             new_signage_point.challenge_hash,
@@ -511,18 +516,22 @@ class FarmerAPI:
             pool_public_key: G1Element,
             computed_quality_string: bytes32
     ):
+        og_pool_state = self.farmer.og_pool_state.get(bytes(pool_public_key))
+        if og_pool_state is None:
+            return
+
         # Otherwise, send the proof of space to the pool
         # When we win a block, we also send the partial to the pool
         required_iters = calculate_iterations_quality(
             self.farmer.constants.DIFFICULTY_CONSTANT_FACTOR,
             computed_quality_string,
             new_proof_of_space.proof.size,
-            self.farmer.pool_difficulty,
+            og_pool_state.difficulty,
             new_proof_of_space.sp_hash,
         )
         if required_iters >= self.farmer.iters_limit:
-            self.farmer.log.info(
-                f"Proof of space not good enough for pool difficulty of {self.farmer.pool_difficulty}"
+            self.farmer.log.debug(
+                f"Proof of space not good enough for pool difficulty of {og_pool_state.difficulty}"
             )
             return
 
@@ -565,9 +574,9 @@ class FarmerAPI:
         assert plot_signature is not None
         agg_sig: G2Element = AugSchemeMPL.aggregate([plot_signature, authentication_signature])
 
-        submit_partial = SubmitPartial(payload, agg_sig, self.farmer.pool_difficulty)
+        submit_partial = SubmitPartial(payload, agg_sig, og_pool_state.difficulty)
         self.farmer.log.debug("Submitting partial ..")
-        self.farmer.last_pool_partial_submit_timestamp = time.time()
+        og_pool_state.last_partial_submit_timestamp = time.time()
         submit_partial_response: Dict
         try:
             submit_partial_response = await self.farmer.pool_api_client.submit_partial(submit_partial)
@@ -581,10 +590,10 @@ class FarmerAPI:
                     "Difficulty too low, adjusting to pool difficulty "
                     f"({submit_partial_response['current_difficulty']})"
                 )
-                self.farmer.pool_difficulty = submit_partial_response["current_difficulty"]
+                og_pool_state.difficulty = submit_partial_response["current_difficulty"]
             else:
                 self.farmer.log.error(
                     f"Error in pooling: {submit_partial_response['error_code'], submit_partial_response['error_message']}"
                 )
         else:
-            self.farmer.pool_difficulty = submit_partial_response["current_difficulty"]
+            og_pool_state.difficulty = submit_partial_response["current_difficulty"]
