@@ -97,13 +97,12 @@ class FarmerAPI:
 
                 if new_proof_of_space.sp_hash not in self.farmer.proofs_of_space:
                     self.farmer.proofs_of_space[new_proof_of_space.sp_hash] = []
-
-                    self.farmer.proofs_of_space[new_proof_of_space.sp_hash].append(
-                        (
-                            new_proof_of_space.plot_identifier,
-                            new_proof_of_space.proof,
-                        )
+                self.farmer.proofs_of_space[new_proof_of_space.sp_hash].append(
+                    (
+                        new_proof_of_space.plot_identifier,
+                        new_proof_of_space.proof,
                     )
+                )
                 self.farmer.cache_add_time[new_proof_of_space.sp_hash] = uint64(int(time.time()))
                 self.farmer.quality_str_to_identifiers[computed_quality_string] = (
                     new_proof_of_space.plot_identifier,
