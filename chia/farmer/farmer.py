@@ -156,7 +156,7 @@ class Farmer:
         self.update_pool_state_task = asyncio.create_task(self._periodically_update_pool_state_task())
         self.cache_clear_task = asyncio.create_task(self._periodically_clear_cache_and_refresh_task())
         if not self.is_pooling_enabled():
-            self.log.info(f"Not pooling as 'pool_payout_address' and/or 'pool_url' are missing in your config")
+            self.log.info(f"Not og pooling as 'pool_payout_address' and/or 'pool_url' are missing in your config")
             return
         self.pool_api_client = PoolApiClient(self.pool_url)
         await self.initialize_pooling()
