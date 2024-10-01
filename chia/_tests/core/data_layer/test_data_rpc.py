@@ -5,6 +5,7 @@ import contextlib
 import copy
 import enum
 import json
+import logging
 import os
 import random
 import sqlite3
@@ -14,7 +15,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, cast
+from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple, cast
 
 import anyio
 import pytest
@@ -165,7 +166,7 @@ async def farm_block_check_singleton(
     await time_out_assert(10, check_mempool_spend_count, True, full_node_api, 1)
     await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(ph))
     await time_out_assert(10, check_singleton_confirmed, True, data_layer, store_id)
-    await full_node_api.wait_for_wallet_synced(wallet_node=wallet, timeout=10)
+    await full_node_api.wait_for_wallet_synced(wallet_node=wallet, timeout=20)
 
 
 async def is_transaction_confirmed(api: WalletRpcApi, tx_id: bytes32) -> bool:
@@ -721,7 +722,7 @@ async def test_get_owned_stores(
     for i in range(0, num_blocks):
         await full_node_api.farm_new_transaction_block(FarmNewBlockProtocol(ph))
     funds = sum(
-        [calculate_pool_reward(uint32(i)) + calculate_base_farmer_reward(uint32(i)) for i in range(1, num_blocks)]
+        calculate_pool_reward(uint32(i)) + calculate_base_farmer_reward(uint32(i)) for i in range(1, num_blocks)
     )
     await time_out_assert(15, wallet_node.wallet_state_manager.main_wallet.get_confirmed_balance, funds)
     async with init_data_layer(wallet_rpc_port=wallet_rpc_port, bt=bt, db_path=tmp_path) as data_layer:
@@ -2239,6 +2240,16 @@ async def test_maximum_full_file_count(
                         assert filename not in filenames
 
 
+@pytest.mark.limit_consensus_modes(reason="does not depend on consensus rules")
+@pytest.mark.anyio
+async def test_unsubscribe_unknown(
+    bare_data_layer_api: DataLayerRpcApi,
+    seeded_random: random.Random,
+) -> None:
+    with pytest.raises(RuntimeError, match="No subscription found for the given store_id."):
+        await bare_data_layer_api.unsubscribe(request={"id": bytes32.random(seeded_random).hex(), "retain": False})
+
+
 @pytest.mark.parametrize("retain", [True, False])
 @pytest.mark.limit_consensus_modes(reason="does not depend on consensus rules")
 @pytest.mark.anyio
@@ -2266,6 +2277,8 @@ async def test_unsubscribe_removes_files(
         store_id = bytes32.from_hexstr(res["id"])
         await farm_block_check_singleton(data_layer, full_node_api, ph, store_id, wallet=wallet_rpc_api.service)
 
+        # subscribe to ourselves
+        await data_rpc_api.subscribe(request={"id": store_id.hex()})
         update_count = 10
         for batch_count in range(update_count):
             key = batch_count.to_bytes(2, "big")
@@ -2994,7 +3007,7 @@ async def test_pagination_cmds(
         if layer == InterfaceLayer.funcs:
             keys = await get_keys_cmd(
                 rpc_port=rpc_port,
-                store_id="0x" + store_id.hex(),
+                store_id=store_id,
                 root_hash=None,
                 fingerprint=None,
                 page=0,
@@ -3003,7 +3016,7 @@ async def test_pagination_cmds(
             )
             keys_values = await get_keys_values_cmd(
                 rpc_port=rpc_port,
-                store_id="0x" + store_id.hex(),
+                store_id=store_id,
                 root_hash=None,
                 fingerprint=None,
                 page=0,
@@ -3012,9 +3025,9 @@ async def test_pagination_cmds(
             )
             kv_diff = await get_kv_diff_cmd(
                 rpc_port=rpc_port,
-                store_id="0x" + store_id.hex(),
-                hash_1="0x" + hash_1.hex(),
-                hash_2="0x" + hash_2.hex(),
+                store_id=store_id,
+                hash_1=hash_1,
+                hash_2=hash_2,
                 fingerprint=None,
                 page=0,
                 max_page_size=max_page_size,
@@ -3222,7 +3235,7 @@ async def test_unsubmitted_batch_update(
             elif layer == InterfaceLayer.funcs:
                 res = await update_data_store_cmd(
                     rpc_port=rpc_port,
-                    store_id="0x" + store_id.hex(),
+                    store_id=store_id,
                     changelist=changelist,
                     fee=None,
                     fingerprint=None,
@@ -3369,7 +3382,7 @@ async def test_unsubmitted_batch_update(
             update_tx_rec1 = res["tx_id"]
         elif layer == InterfaceLayer.funcs:
             res = await submit_pending_root_cmd(
-                store_id="0x" + store_id.hex(),
+                store_id=store_id,
                 fee=None,
                 fingerprint=None,
                 rpc_port=rpc_port,
@@ -3712,3 +3725,90 @@ async def test_unsubmitted_batch_db_migration(
         await farm_block_with_spend(full_node_api, ph, update_tx_rec1, wallet_rpc_api)
         keys = await data_rpc_api.get_keys({"id": store_id.hex()})
         assert keys == {"keys": ["0x30303031", "0x30303030"]}
+
+
+@pytest.mark.limit_consensus_modes(reason="does not depend on consensus rules")
+@boolean_datacases(name="auto_subscribe_to_local_stores", false="do not auto subscribe", true="auto subscribe")
+@pytest.mark.anyio
+async def test_auto_subscribe_to_local_stores(
+    self_hostname: str,
+    one_wallet_and_one_simulator_services: SimulatorsAndWalletsServices,
+    tmp_path: Path,
+    monkeypatch: Any,
+    auto_subscribe_to_local_stores: bool,
+) -> None:
+    wallet_rpc_api, full_node_api, wallet_rpc_port, ph, bt = await init_wallet_and_node(
+        self_hostname, one_wallet_and_one_simulator_services
+    )
+    manage_data_interval = 5
+    fake_store = bytes32([1] * 32)
+
+    async def mock_get_store_ids(self: Any) -> Set[bytes32]:
+        return {fake_store}
+
+    async def mock_dl_track_new(self: Any, request: Dict[str, Any]) -> Dict[str, Any]:
+        # ignore and just return empty response
+        return {}
+
+    with monkeypatch.context() as m:
+        m.setattr("chia.data_layer.data_store.DataStore.get_store_ids", mock_get_store_ids)
+        m.setattr("chia.rpc.wallet_rpc_client.WalletRpcClient.dl_track_new", mock_dl_track_new)
+
+        config = bt.config
+        config["data_layer"]["auto_subscribe_to_local_stores"] = auto_subscribe_to_local_stores
+        bt.change_config(new_config=config)
+
+        async with init_data_layer(
+            wallet_rpc_port=wallet_rpc_port,
+            bt=bt,
+            db_path=tmp_path,
+            manage_data_interval=manage_data_interval,
+            maximum_full_file_count=100,
+        ) as data_layer:
+            data_rpc_api = DataLayerRpcApi(data_layer)
+
+            await asyncio.sleep(manage_data_interval)
+
+            response = await data_rpc_api.subscriptions(request={})
+
+            if auto_subscribe_to_local_stores:
+                assert fake_store.hex() in response["store_ids"]
+            else:
+                assert fake_store.hex() not in response["store_ids"]
+
+
+@pytest.mark.limit_consensus_modes(reason="does not depend on consensus rules")
+@pytest.mark.anyio
+async def test_local_store_exception(
+    self_hostname: str,
+    one_wallet_and_one_simulator_services: SimulatorsAndWalletsServices,
+    tmp_path: Path,
+    monkeypatch: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    wallet_rpc_api, full_node_api, wallet_rpc_port, ph, bt = await init_wallet_and_node(
+        self_hostname, one_wallet_and_one_simulator_services
+    )
+    manage_data_interval = 5
+    fake_store = bytes32([1] * 32)
+
+    async def mock_get_store_ids(self: Any) -> Set[bytes32]:
+        return {fake_store}
+
+    with monkeypatch.context() as m, caplog.at_level(logging.INFO):
+        m.setattr("chia.data_layer.data_store.DataStore.get_store_ids", mock_get_store_ids)
+
+        config = bt.config
+        config["data_layer"]["auto_subscribe_to_local_stores"] = True
+        bt.change_config(new_config=config)
+
+        async with init_data_layer(
+            wallet_rpc_port=wallet_rpc_port,
+            bt=bt,
+            db_path=tmp_path,
+            manage_data_interval=manage_data_interval,
+            maximum_full_file_count=100,
+        ):
+            await asyncio.sleep(manage_data_interval)
+
+            assert f"Can't subscribe to local store {fake_store.hex()}:" in caplog.text

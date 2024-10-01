@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import json
 import logging
 import os
@@ -51,8 +52,10 @@ from chia.data_layer.data_layer_util import (
     Subscription,
     SyncStatus,
     TerminalNode,
+    Unspecified,
     UnsubscribeData,
     leaf_hash,
+    unspecified,
 )
 from chia.data_layer.data_layer_wallet import DataLayerWallet, Mirror, SingletonRecord, verify_offer
 from chia.data_layer.data_store import DataStore
@@ -122,6 +125,9 @@ class DataLayer:
     _wallet_rpc: Optional[WalletRpcClient] = None
     subscription_lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
     subscription_update_concurrency: int = 5
+    client_timeout: aiohttp.ClientTimeout = dataclasses.field(
+        default_factory=functools.partial(aiohttp.ClientTimeout, total=45, sock_connect=5)
+    )
 
     @property
     def server(self) -> ChiaServer:
@@ -183,6 +189,9 @@ class DataLayer:
             maximum_full_file_count=config.get("maximum_full_file_count", 1),
             subscription_update_concurrency=config.get("subscription_update_concurrency", 5),
             unsubscribe_data_queue=[],
+            client_timeout=aiohttp.ClientTimeout(
+                total=config.get("client_timeout", 45), sock_connect=config.get("connect_timeout", 5)
+            ),
         )
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -384,7 +393,7 @@ class DataLayer:
         self,
         store_id: bytes32,
         key: bytes,
-        root_hash: Optional[bytes32] = None,
+        root_hash: Union[bytes32, Unspecified] = unspecified,
     ) -> bytes32:
         await self._update_confirmation_status(store_id=store_id)
 
@@ -392,7 +401,9 @@ class DataLayer:
             node = await self.data_store.get_node_by_key(store_id=store_id, key=key, root_hash=root_hash)
             return node.hash
 
-    async def get_value(self, store_id: bytes32, key: bytes, root_hash: Optional[bytes32] = None) -> bytes:
+    async def get_value(
+        self, store_id: bytes32, key: bytes, root_hash: Union[bytes32, Unspecified] = unspecified
+    ) -> bytes:
         await self._update_confirmation_status(store_id=store_id)
 
         async with self.data_store.transaction():
@@ -400,7 +411,11 @@ class DataLayer:
             res = await self.data_store.get_node_by_key(store_id=store_id, key=key, root_hash=root_hash)
             return res.value
 
-    async def get_keys_values(self, store_id: bytes32, root_hash: Optional[bytes32]) -> List[TerminalNode]:
+    async def get_keys_values(
+        self,
+        store_id: bytes32,
+        root_hash: Union[bytes32, Unspecified],
+    ) -> List[TerminalNode]:
         await self._update_confirmation_status(store_id=store_id)
 
         res = await self.data_store.get_keys_values(store_id, root_hash)
@@ -411,7 +426,7 @@ class DataLayer:
     async def get_keys_values_paginated(
         self,
         store_id: bytes32,
-        root_hash: Optional[bytes32],
+        root_hash: Union[bytes32, Unspecified],
         page: int,
         max_page_size: Optional[int] = None,
     ) -> KeysValuesPaginationData:
@@ -422,7 +437,7 @@ class DataLayer:
         res = await self.data_store.get_keys_values_paginated(store_id, page, max_page_size, root_hash)
         return res
 
-    async def get_keys(self, store_id: bytes32, root_hash: Optional[bytes32]) -> List[bytes]:
+    async def get_keys(self, store_id: bytes32, root_hash: Union[bytes32, Unspecified]) -> List[bytes]:
         await self._update_confirmation_status(store_id=store_id)
 
         res = await self.data_store.get_keys(store_id, root_hash)
@@ -431,7 +446,7 @@ class DataLayer:
     async def get_keys_paginated(
         self,
         store_id: bytes32,
-        root_hash: Optional[bytes32],
+        root_hash: Union[bytes32, Unspecified],
         page: int,
         max_page_size: Optional[int] = None,
     ) -> KeysPaginationData:
@@ -578,7 +593,6 @@ class DataLayer:
                 max_generation=singleton_record.generation,
             )
             try:
-                timeout = self.config.get("client_timeout", 15)
                 proxy_url = self.config.get("proxy_url", None)
                 success = await insert_from_delta_file(
                     self.data_store,
@@ -587,7 +601,7 @@ class DataLayer:
                     [record.root for record in reversed(to_download)],
                     server_info,
                     self.server_files_location,
-                    timeout,
+                    self.client_timeout,
                     self.log,
                     proxy_url,
                     await self.get_downloader(store_id, url),
@@ -758,6 +772,10 @@ class DataLayer:
 
     async def unsubscribe(self, store_id: bytes32, retain_data: bool) -> None:
         async with self.subscription_lock:
+            subscriptions = await self.data_store.get_subscriptions()
+            if store_id not in (subscription.store_id for subscription in subscriptions):
+                raise RuntimeError("No subscription found for the given store_id.")
+
             # Unsubscribe is processed later, after all fetching of data is done, to avoid races.
             self.unsubscribe_data_queue.append(UnsubscribeData(store_id, retain_data))
 
@@ -820,7 +838,13 @@ class DataLayer:
         return await self.data_store.get_kv_diff(store_id, hash_1, hash_2)
 
     async def get_kv_diff_paginated(
-        self, store_id: bytes32, hash_1: bytes32, hash_2: bytes32, page: int, max_page_size: Optional[int] = None
+        self,
+        store_id: bytes32,
+        # NOTE: empty is expressed as zeros
+        hash_1: bytes32,
+        hash_2: bytes32,
+        page: int,
+        max_page_size: Optional[int] = None,
     ) -> KVDiffPaginationData:
         if max_page_size is None:
             max_page_size = 40 * 1024 * 1024
@@ -849,21 +873,45 @@ class DataLayer:
                 await asyncio.sleep(0.1)
 
         while not self._shut_down:
+            # Add existing subscriptions
             async with self.subscription_lock:
                 subscriptions = await self.data_store.get_subscriptions()
 
-            # Subscribe to all local store_ids that we can find on chain.
-            local_store_ids = await self.data_store.get_store_ids()
+            # pseudo-subscribe to all unsubscribed owned stores
+            # Need this to make sure we process updates and generate DAT files
+            try:
+                owned_stores = await self.get_owned_stores()
+            except ValueError:
+                # Sometimes the DL wallet isn't available, so we can't get the owned stores.
+                # We'll try again next time.
+                owned_stores = []
             subscription_store_ids = {subscription.store_id for subscription in subscriptions}
-            for local_id in local_store_ids:
-                if local_id not in subscription_store_ids:
+            for record in owned_stores:
+                store_id = record.launcher_id
+                if store_id not in subscription_store_ids:
                     try:
-                        subscription = await self.subscribe(local_id, [])
-                        subscriptions.insert(0, subscription)
+                        # don't actually subscribe, just add to the list
+                        subscriptions.insert(0, Subscription(store_id=store_id, servers_info=[]))
                     except Exception as e:
                         self.log.info(
-                            f"Can't subscribe to locally stored {local_id}: {type(e)} {e} {traceback.format_exc()}"
+                            f"Can't subscribe to owned store {store_id}: {type(e)} {e} {traceback.format_exc()}"
                         )
+
+            # Optionally
+            # Subscribe to all local non-owned store_ids that we can find on chain.
+            # This is the prior behavior where all local stores, both owned and not owned, are subscribed to.
+            if self.config.get("auto_subscribe_to_local_stores", False):
+                local_store_ids = await self.data_store.get_store_ids()
+                subscription_store_ids = {subscription.store_id for subscription in subscriptions}
+                for local_id in local_store_ids:
+                    if local_id not in subscription_store_ids:
+                        try:
+                            subscription = await self.subscribe(local_id, [])
+                            subscriptions.insert(0, subscription)
+                        except Exception as e:
+                            self.log.info(
+                                f"Can't subscribe to local store {local_id}: {type(e)} {e} {traceback.format_exc()}"
+                            )
 
             work_queue: asyncio.Queue[Job[Subscription]] = asyncio.Queue()
             async with QueuedAsyncPool.managed(
@@ -1026,7 +1074,7 @@ class DataLayer:
                 for our_offer_store in maker
             }
 
-            wallet_offer, trade_record = await self.wallet_rpc.create_offer_for_ids(
+            res = await self.wallet_rpc.create_offer_for_ids(
                 offer_dict=offer_dict,
                 solver=solver,
                 driver_dict={},
@@ -1036,12 +1084,10 @@ class DataLayer:
                 # This is not a change in behavior, the default was already implicit.
                 tx_config=DEFAULT_TX_CONFIG,
             )
-            if wallet_offer is None:
-                raise Exception("offer is None despite validate_only=False")
 
             offer = Offer(
-                trade_id=trade_record.trade_id,
-                offer=bytes(wallet_offer),
+                trade_id=res.trade_record.trade_id,
+                offer=bytes(res.offer),
                 taker=taker,
                 maker=tuple(our_store_proofs.values()),
             )
@@ -1118,14 +1164,16 @@ class DataLayer:
         # after the transaction is submitted to the chain.  If we roll back data we
         # may lose published data.
 
-        trade_record = await self.wallet_rpc.take_offer(
-            offer=offer,
-            solver=solver,
-            fee=fee,
-            # TODO: probably shouldn't be default but due to peculiarities in the RPC, we're using a stop gap.
-            # This is not a change in behavior, the default was already implicit.
-            tx_config=DEFAULT_TX_CONFIG,
-        )
+        trade_record = (
+            await self.wallet_rpc.take_offer(
+                offer=offer,
+                solver=solver,
+                fee=fee,
+                # TODO: probably shouldn't be default but due to peculiarities in the RPC, we're using a stop gap.
+                # This is not a change in behavior, the default was already implicit.
+                tx_config=DEFAULT_TX_CONFIG,
+            )
+        ).trade_record
 
         return trade_record
 
